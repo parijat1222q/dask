@@ -362,11 +362,13 @@ Linear Algebra
    :toctree: generated/
 
    linalg.cholesky
+   linalg.det
    linalg.inv
    linalg.lstsq
    linalg.lu
    linalg.norm
    linalg.qr
+   linalg.slogdet
    linalg.solve
    linalg.solve_triangular
    linalg.svd

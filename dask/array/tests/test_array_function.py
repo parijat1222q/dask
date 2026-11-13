@@ -84,7 +84,6 @@ def test_array_function_fft(func):
     "func",
     [
         lambda x: np.min_scalar_type(x),
-        lambda x: np.linalg.det(x),
         lambda x: np.linalg.eigvals(x),
     ],
 )
