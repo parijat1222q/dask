@@ -1138,3 +1138,150 @@ def test_norm_implemented_errors(shape, chunks, axis, norm, keepdims):
     if len(shape) > 2 and len(axis) == 2:
         with pytest.raises(NotImplementedError):
             da.linalg.norm(d, ord=norm, axis=axis, keepdims=keepdims)
+
+
+@pytest.mark.parametrize(
+    "dtype", [np.int64, np.float32, np.float64, np.complex64, np.complex128]
+)
+@pytest.mark.parametrize("chunks", [(2, 3), (3, 2), (4, 4), (9, 9)])
+def test_slogdet_panel_pivoting(dtype, chunks):
+    rng = np.random.default_rng(11042)
+    a = rng.integers(-8, 9, (9, 9)).astype(dtype)
+    if np.issubdtype(dtype, np.complexfloating):
+        a += 1j * rng.integers(-8, 9, (9, 9))
+    expected = np.linalg.slogdet(a)
+    x = da.from_array(a, chunks=chunks)
+    actual = da.linalg.slogdet(x)
+    for result, reference in zip(actual, expected):
+        assert_eq(result, reference)
+    assert_eq(da.linalg.det(x), np.linalg.det(a), rtol=1e-4)
+    for result, reference in zip(np.linalg.slogdet(x), expected):
+        assert_eq(result, reference)
+    assert_eq(np.linalg.det(x), np.linalg.det(a), rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "dtype", [np.int64, np.float32, np.float64, np.complex64, np.complex128]
+)
+@pytest.mark.parametrize("size", [0, 1, 5])
+def test_slogdet_empty_singular(dtype, size):
+    a = np.zeros((size, size), dtype=dtype)
+    x = da.from_array(a, chunks=2)
+    for actual, expected in zip(da.linalg.slogdet(x), np.linalg.slogdet(a)):
+        assert_eq(actual, expected)
+    assert_eq(da.linalg.det(x), np.linalg.det(a))
+
+
+@pytest.mark.parametrize("scale", [1e200, 1e-200])
+def test_slogdet_scaling(scale):
+    a = np.eye(6) * scale
+    for actual, expected in zip(
+        da.linalg.slogdet(da.from_array(a, chunks=2)), np.linalg.slogdet(a)
+    ):
+        assert_eq(actual, expected)
+
+
+@pytest.mark.parametrize("phase", [1, -1, 1j, -1j, np.exp(0.37j)])
+def test_slogdet_cross_chunk_permutation(phase):
+    # Every leading 2x2 diagonal block is singular, but the full matrix is not.
+    a = np.eye(6, dtype=np.complex128)[[3, 4, 5, 0, 1, 2]] * phase
+    sign, logabsdet = da.linalg.slogdet(da.from_array(a, chunks=2))
+    assert_eq(sign, np.complex128(-(phase**6)))
+    assert_eq(logabsdet, np.float64(0), atol=1e-14)
+
+
+def test_slogdet_lazy_shared_factors():
+    import dask
+    from dask.callbacks import Callback
+
+    tasks = []
+    x = da.from_array(np.eye(9)[::-1], chunks=(2, 3))
+    with Callback(pretask=lambda key, dsk, state: tasks.append(key)):
+        sign, logabsdet = da.linalg.slogdet(x)
+        assert not tasks
+        actual = dask.compute(sign, logabsdet, optimize_graph=False, scheduler="sync")
+    np.testing.assert_allclose(actual, [1, 0])
+    factors = [key for key in tasks if str(key).startswith("_slogdet_factor-")]
+    assert len(factors) == 3
+    assert same_keys(sign, da.linalg.slogdet(x)[0])
+
+
+@pytest.mark.parametrize("shape", [(), (3,), (2, 3), (2, 2, 2)])
+def test_slogdet_invalid_shape(shape):
+    with pytest.raises(ValueError, match="square"):
+        da.linalg.slogdet(da.ones(shape, chunks=1))
+
+
+def test_slogdet_unknown_chunks():
+    x = da.eye(4, chunks=2)
+    x = x[x[:, 0] >= 0]
+    with pytest.raises(ValueError, match="known chunk sizes"):
+        da.linalg.slogdet(x)
+
+
+def test_slogdet_unsupported_half():
+    with pytest.raises(TypeError, match="float16"):
+        da.linalg.slogdet(da.eye(4, chunks=2, dtype=np.float16))
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+def test_slogdet_nonfinite(value):
+    a = np.eye(4)
+    a[0, 0] = value
+    with pytest.raises(ValueError, match="infs or NaNs"):
+        da.linalg.slogdet(da.from_array(a, chunks=2))[0].compute()
+
+
+@pytest.mark.parametrize("magnitude", [1e-320, 1.7e308])
+def test_slogdet_extreme_complex_phase(magnitude):
+    # The mathematical phase is i and log magnitude is 2*log(magnitude)+log(2).
+    # Direct abs(z) overflows for the large case; complex division by a
+    # subnormal real magnitude can overflow internally for the small case.
+    a = np.diag([complex(magnitude, magnitude)] * 2)
+    sign, logabsdet = da.linalg.slogdet(da.from_array(a, chunks=1))
+    assert_eq(sign, np.complex128(1j), atol=1e-14)
+    assert_eq(logabsdet, np.float64(2 * np.log(magnitude) + np.log(2)))
+
+
+def test_slogdet_zero_length_chunks():
+    a = np.eye(4)[::-1]
+    x = da.from_array(a, chunks=((2, 0, 2), (1, 0, 3)))
+    for actual, expected in zip(da.linalg.slogdet(x), np.linalg.slogdet(a)):
+        assert_eq(actual, expected)
+
+
+def test_slogdet_panel_tasks_and_input_unchanged():
+    import dask
+    from dask.callbacks import Callback
+
+    rng = np.random.default_rng(11042)
+    a = rng.random((11, 11))
+    original = a.copy()
+    x = da.from_array(a, chunks=(3, 4))
+    factors = []
+    summaries = []
+
+    def record(key, result, dsk, state, worker):
+        if str(key).startswith("_slogdet_factor-"):
+            factors.append(result[0].shape)
+        if str(key).startswith("_slogdet_finish-"):
+            summaries.append(result)
+
+    with Callback(posttask=record):
+        actual = dask.compute(
+            *da.linalg.slogdet(x), optimize_graph=False, scheduler="sync"
+        )
+    np.testing.assert_allclose(actual, np.linalg.slogdet(a))
+    assert factors == [(11, 4), (7, 4), (3, 3)]
+    assert len(summaries) == 1
+    assert all(np.ndim(value) == 0 for value in summaries[0])
+    np.testing.assert_array_equal(a, original)
+
+
+@pytest.mark.parametrize("magnitude", [1e-310, 1e-200, 1e200])
+def test_slogdet_scaled_nondiagonal(magnitude):
+    a = np.array([[1.0, 2.0, 4.0], [5.0, 3.0, 7.0], [2.0, 8.0, 6.0]]) * magnitude
+    # Exact integer determinant is 66; scaling changes only log magnitude.
+    sign, logabsdet = da.linalg.slogdet(da.from_array(a, chunks=(2, 1)))
+    assert_eq(sign, np.float64(1))
+    assert_eq(logabsdet, np.float64(np.log(66) + 3 * np.log(magnitude)))

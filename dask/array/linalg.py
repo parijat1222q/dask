@@ -971,6 +971,201 @@ def svd(a, coerce_signs=True, full_matrices=False):
     return u, s, v
 
 
+def _slogdet_assemble(parts: list[np.ndarray]) -> np.ndarray:
+    return np.concatenate(parts, axis=0)
+
+
+def _slogdet_factor(panel: np.ndarray) -> tuple:
+    import scipy.linalg
+
+    # Older SciPy/LAPACK versions reject empty factors. The empty product is 1.
+    if panel.shape[1] == 0:
+        return panel, np.empty(0, dtype=np.intp), 1, 0
+    # Some LAPACK versions overflow internally when dividing complex subnormal
+    # pivots. Positive scaling preserves the L factor used by trailing updates.
+    scale = np.maximum(np.abs(panel.real).max(), np.abs(panel.imag).max())
+    log_scale = 0
+    if 0 < scale < np.finfo(panel.real.dtype).tiny:
+        if np.iscomplexobj(panel):
+            panel = panel.real / scale + 1j * (panel.imag / scale)
+        else:
+            panel = panel / scale
+        log_scale = np.log(scale)
+    # A zero pivot is a valid result for a determinant, not an exceptional solve.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", scipy.linalg.LinAlgWarning)
+        lu, pivots = scipy.linalg.lu_factor(panel)
+    diagonal = np.diag(lu[: panel.shape[1]])
+    if np.any(diagonal == 0):
+        return lu, pivots, 0, -np.inf
+    if np.iscomplexobj(diagonal):
+        # Form phase and log magnitude without overflowing abs(z), or dividing
+        # complex values by subnormal magnitudes (which can overflow internally).
+        scale = np.maximum(np.abs(diagonal.real), np.abs(diagonal.imag))
+        real = diagonal.real / scale
+        imag = diagonal.imag / scale
+        magnitude = np.hypot(real, imag)
+        phases = real / magnitude + 1j * (imag / magnitude)
+        logarithms = np.log(scale) + np.log(magnitude)
+    else:
+        phases = np.sign(diagonal)
+        logarithms = np.log(np.abs(diagonal))
+    parity = np.count_nonzero(pivots != np.arange(len(pivots))) % 2
+    sign = np.prod(phases) * (-1 if parity else 1)
+    return lu, pivots, sign, (logarithms + log_scale).sum()
+
+
+def _slogdet_update(factor: tuple, panel: np.ndarray) -> np.ndarray:
+    import scipy.linalg
+
+    lu, pivots, sign, _ = factor
+    width = lu.shape[1]
+    if width == 0:
+        return panel
+    if sign == 0:
+        return np.zeros_like(panel[width:])
+    # Different trailing columns share the input panel graph. Do not mutate it.
+    panel = panel.copy()
+    for row, target in enumerate(pivots):
+        if row != target:
+            panel[[row, target]] = panel[[target, row]]
+    upper = scipy.linalg.solve_triangular(
+        lu[:width], panel[:width], lower=True, unit_diagonal=True
+    )
+    return panel[width:] - lu[width:] @ upper
+
+
+def _slogdet_finish(
+    summaries: list[tuple], sign_dtype: np.dtype, log_dtype: np.dtype
+) -> tuple:
+    if any(sign == 0 for sign, _ in summaries):
+        sign, logabsdet = 0, -np.inf
+    else:
+        sign = np.prod([sign for sign, _ in summaries])
+        logabsdet = sum(logabsdet for _, logabsdet in summaries)
+    return (
+        np.asarray(sign, dtype=sign_dtype)[()],
+        np.asarray(logabsdet, dtype=log_dtype)[()],
+    )
+
+
+def slogdet(a: Array) -> tuple[Array, Array]:
+    """Compute the sign and natural logarithm of a matrix determinant.
+
+    Parameters
+    ----------
+    a : Array
+        A two-dimensional square array with known chunk sizes and finite values.
+
+    Returns
+    -------
+    sign : Array
+        Scalar sign, or unit complex phase. Zero for a singular matrix.
+    logabsdet : Array
+        Scalar natural logarithm of the absolute determinant. Negative infinity
+        for a singular matrix.
+
+    Notes
+    -----
+    Partial row pivoting is performed across all remaining rows, including rows
+    in different input chunks. Each task assembles at most one column panel,
+    with the width of an input column chunk and up to ``a.shape[0]`` rows.
+    These panels, their factors, and temporary copies must fit in worker memory.
+    Use multiple column chunks to avoid assembling the entire matrix in a task.
+    The graph has a sequential dependency between successive panel factors;
+    updates to different trailing column panels may run in parallel.
+
+    Stacked matrices and non-NumPy chunk backends are not supported.
+
+    See Also
+    --------
+    numpy.linalg.slogdet
+    dask.array.linalg.det
+
+    Examples
+    --------
+    >>> import dask.array as da
+    >>> a = da.from_array([[0., 1.], [1., 0.]], chunks=1)
+    >>> sign, logabsdet = da.linalg.slogdet(a)
+    >>> float(sign.compute())
+    -1.0
+    >>> float(logabsdet.compute())
+    0.0
+    """
+    if a.ndim != 2:
+        raise ValueError("slogdet requires a two-dimensional square array")
+    if any(np.isnan(size) for axis in a.chunks for size in axis):
+        raise ValueError(
+            "slogdet requires known chunk sizes; use compute_chunk_sizes first"
+        )
+    if a.shape[0] != a.shape[1]:
+        raise ValueError("slogdet requires a square array")
+    if not isinstance(a._meta, np.ndarray):
+        raise NotImplementedError("slogdet currently supports NumPy chunks only")
+
+    # Infer NumPy's integer promotion and real dtype for complex logarithms
+    # without executing any tasks from the input graph.
+    sign_meta, log_meta = np.linalg.slogdet(np.ones((1, 1), dtype=a.dtype))
+    a = a.astype(sign_meta.dtype)
+    blocks = a.to_delayed()
+    panels = [
+        delayed(_slogdet_assemble, pure=True)(list(blocks[:, column]))
+        for column in range(a.numblocks[1])
+    ]
+    summaries = []
+    for column in range(len(panels)):
+        factor = delayed(_slogdet_factor, pure=True)(panels[column])
+        # Retain only scalars for the final reduction, not all dense LU factors.
+        summaries.append(factor[2:])
+        for trailing in range(column + 1, len(panels)):
+            panels[trailing] = delayed(_slogdet_update, pure=True)(
+                factor, panels[trailing]
+            )
+    result = delayed(_slogdet_finish, pure=True)(
+        summaries, sign_meta.dtype, log_meta.dtype
+    )
+    return (
+        from_delayed(result[0], shape=(), dtype=sign_meta.dtype),
+        from_delayed(result[1], shape=(), dtype=log_meta.dtype),
+    )
+
+
+def det(a: Array) -> Array:
+    """Compute a matrix determinant using partial row pivoting.
+
+    Parameters
+    ----------
+    a : Array
+        A two-dimensional square NumPy-backed array with known chunk sizes
+        and finite values.
+
+    Returns
+    -------
+    determinant : Array
+        Scalar determinant. Use ``slogdet`` when the result may overflow
+        or underflow.
+
+    Notes
+    -----
+    This uses the same panel factorization and memory requirements as
+    :func:`slogdet`. Stacked matrices are not supported.
+
+    See Also
+    --------
+    numpy.linalg.det
+    dask.array.linalg.slogdet
+
+    Examples
+    --------
+    >>> import dask.array as da
+    >>> a = da.from_array([[0., 1.], [1., 0.]], chunks=1)
+    >>> float(da.linalg.det(a).compute())
+    -1.0
+    """
+    sign, logabsdet = slogdet(a)
+    return sign * np.exp(logabsdet)
+
+
 def _solve_triangular_lower(a, b):
     return solve_triangular_safe(a, b, lower=True)
 
